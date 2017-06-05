@@ -15,29 +15,6 @@
  */
 package com.netflix.dyno.jedis;
 
-import com.netflix.dyno.connectionpool.*;
-import com.netflix.dyno.connectionpool.Connection;
-import com.netflix.dyno.connectionpool.exception.DynoException;
-import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
-import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
-import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
-import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
-import com.netflix.dyno.connectionpool.impl.utils.ZipUtils;
-import com.netflix.dyno.jedis.JedisConnectionFactory.JedisConnection;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import redis.clients.jedis.BinaryClient.LIST_POSITION;
-import redis.clients.jedis.*;
-import redis.clients.jedis.commands.RedisPipeline;
-import redis.clients.jedis.exceptions.JedisConnectionException;
-import redis.clients.jedis.params.geo.GeoRadiusParam;
-import redis.clients.jedis.params.sortedset.ZAddParams;
-import redis.clients.jedis.params.sortedset.ZIncrByParams;
-
-import javax.annotation.concurrent.NotThreadSafe;
-
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -46,7 +23,42 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionStrategy;
+import javax.annotation.concurrent.NotThreadSafe;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.netflix.dyno.connectionpool.BaseOperation;
+import com.netflix.dyno.connectionpool.Connection;
+import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
+import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionStrategy;
+import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
+import com.netflix.dyno.connectionpool.RetryPolicy;
+import com.netflix.dyno.connectionpool.exception.DynoException;
+import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
+import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
+import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
+import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
+import com.netflix.dyno.connectionpool.impl.utils.ZipUtils;
+import com.netflix.dyno.jedis.JedisConnectionFactory.JedisConnection;
+
+import redis.clients.jedis.BinaryClient.LIST_POSITION;
+import redis.clients.jedis.Builder;
+import redis.clients.jedis.BuilderFactory;
+import redis.clients.jedis.GeoCoordinate;
+import redis.clients.jedis.GeoRadiusResponse;
+import redis.clients.jedis.GeoUnit;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Response;
+import redis.clients.jedis.ScanResult;
+import redis.clients.jedis.SortingParams;
+import redis.clients.jedis.Tuple;
+import redis.clients.jedis.commands.RedisPipeline;
+import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.params.geo.GeoRadiusParam;
+import redis.clients.jedis.params.sortedset.ZAddParams;
+import redis.clients.jedis.params.sortedset.ZIncrByParams;
 
 @NotThreadSafe
 public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
@@ -58,7 +70,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     private volatile Connection<Jedis> connection;
     private final DynoJedisPipelineMonitor opMonitor;
     private final ConnectionPoolMonitor cpMonitor;
-
+    private final ConnectionPoolConfiguration cpConfiguration;
+    
     // the cached pipeline
     private volatile Pipeline jedisPipeline = null;
     // the cached row key for the pipeline. all subsequent requests to pipeline must be the same. this is used to check that.
@@ -68,10 +81,11 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     private static final String DynoPipeline = "DynoPipeline";
 
-    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor) {
+    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor,ConnectionPoolConfiguration cpConfig) {
         this.connPool = cPool;
         this.opMonitor = operationMonitor;
         this.cpMonitor = connPoolMonitor;
+        this.cpConfiguration = cpConfig;
     }
 
     private void checkKey(final String key) {
@@ -302,21 +316,35 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         }
 
         Response<R> executeOperation(final OpName opName) {
-            try {
-                opMonitor.recordOperation(opName.name());
-                return execute(jedisPipeline);
-
-            } catch (JedisConnectionException ex) {
-                handleConnectionException(ex);
-                throw ex;
-            }
+        	
+        	RetryPolicy retry = cpConfiguration.getRetryPolicyFactory().getRetryPolicy();
+    		retry.begin();
+        	
+        	do {
+		            try {
+		            	
+		                opMonitor.recordOperation(opName.name());
+		                
+		                Response<R> result = execute(jedisPipeline); 
+		                
+		                retry.success();
+		                return result;
+		
+		            } catch (JedisConnectionException ex) {
+		                handleConnectionException(ex);
+		                retry.failure(ex);
+		                throw ex;
+		            }
+		            
+        	}while (retry.allowRetry());
+        	
         }
 
-        void handleConnectionException(JedisConnectionException ex) {
-            DynoException e = new FatalConnectionException(ex).setAttempt(1);
-            pipelineEx.set(e);
-            cpMonitor.incOperationFailure(connection.getHost(), e);
-        }
+	    void handleConnectionException(JedisConnectionException ex) {
+	        DynoException e = new FatalConnectionException(ex).setAttempt(1);
+	        pipelineEx.set(e);
+	        cpMonitor.incOperationFailure(connection.getHost(), e);
+	    }
     }
 
     private abstract class PipelineCompressionOperation<R> extends PipelineOperation<R> {
