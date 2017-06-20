@@ -2205,10 +2205,15 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     		   
     		  // Re-build all previous Pipeline operations
     		  if (retry.getAttemptCount()>=1){
-    			  for(OperationMetadata op : operationQueue){
-    				  Method m = this.getClass().getDeclaredMethod(op.getName().name().toLowerCase(), op.toClassArraySignature());
-    				  m.invoke(this, op.getArgs());
+    			  
+    			  LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
+    			  oq.addAll(operationQueue);
+    			  
+    			  for(OperationMetadata o : oq){
+    				  Method m = this.getClass().getDeclaredMethod(o.getName().name().toLowerCase(), o.toClassArraySignature());
+    				  m.invoke(this, o.getArgs());
     			  }
+    			  operationQueue = new LinkedList<>();
     		  }
     		  
                jedisPipeline.sync();
