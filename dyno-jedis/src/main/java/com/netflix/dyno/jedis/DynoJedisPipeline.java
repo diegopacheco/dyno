@@ -56,6 +56,7 @@ import redis.clients.jedis.SortingParams;
 import redis.clients.jedis.Tuple;
 import redis.clients.jedis.commands.RedisPipeline;
 import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.exceptions.JedisException;
 import redis.clients.jedis.params.geo.GeoRadiusParam;
 import redis.clients.jedis.params.sortedset.ZAddParams;
 import redis.clients.jedis.params.sortedset.ZIncrByParams;
@@ -326,7 +327,9 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 		            	
 		                opMonitor.recordOperation(opName.name());
 		                
-		                Response<R> result = execute(jedisPipeline); 
+		                Response<R> result = execute(jedisPipeline);
+		                if (result!=null)
+		                	result .set(true);
 		                
 		                retry.success();
 		                return result;
@@ -338,6 +341,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 		                retry.failure(ex);
 		                lastException = ex;
 		            } catch(Exception e){
+		            	retry.failure(e);
 		            	lastException = new RuntimeException(e);
 		            }
 		            
@@ -571,7 +575,13 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
                     long startTime = System.nanoTime() / 1000;
                     try {
                         return jedisPipeline.get(key);
-                    } finally {
+                    }catch(JedisException je){
+                    	throw je;
+                    }
+                    catch(Exception e){
+                    	throw new RuntimeException(e);
+                    }
+                    finally {
                         long duration = System.nanoTime() / 1000 - startTime;
                         opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
                     }
@@ -2103,7 +2113,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
                     discardPipeline(false);
                     releaseConnection();
                 }
-				return null;
+				return new Response<String>(null);
             }
         }.execute(theKey.get(), OpName.SYNC);
     }
