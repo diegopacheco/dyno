@@ -42,6 +42,8 @@ public class DynoJedisPipelineTest {
 				))
 				.withHostSupplier(hs).build();
 		
+		dynoClient.set("k1", "1");
+		
 		DynoJedisPipeline pipe = dynoClient.pipelined();
 
 		Response<String> result = pipe.get("k1");

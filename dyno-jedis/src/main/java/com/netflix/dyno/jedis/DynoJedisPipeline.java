@@ -311,12 +311,13 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         Response<R> execute(final String key, final OpName opName) {
 
             checkKey(key);
-            return executeOperation(opName);
+            return executeOperation(opName,key);
 
         }
 
-        Response<R> executeOperation(final OpName opName) {
+        Response<R> executeOperation(final OpName opName,final String key) {
         	
+        	RuntimeException lastException = null;
         	RetryPolicy retry = cpConfiguration.getRetryPolicyFactory().getRetryPolicy();
     		retry.begin();
         	
@@ -331,12 +332,18 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 		                return result;
 		
 		            } catch (JedisConnectionException ex) {
+		            	fallbackNextConnectionNode(key);
+		            	
 		                handleConnectionException(ex);
 		                retry.failure(ex);
-		                throw ex;
+		                lastException = ex;
+		            } catch(Exception e){
+		            	lastException = new RuntimeException(e);
 		            }
 		            
         	}while (retry.allowRetry());
+        	
+        	throw lastException;
         	
         }
 
@@ -345,6 +352,33 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	        pipelineEx.set(e);
 	        cpMonitor.incOperationFailure(connection.getHost(), e);
 	    }
+	    
+	    private void fallbackNextConnectionNode(final String key){
+            try {
+                connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
+
+                    @Override
+                    public String getName() {
+                        return DynoPipeline;
+                    }
+
+                    @Override
+                    public String getKey() {
+                        return key;
+                    }
+                });
+                
+                Jedis jedis = ((JedisConnection) connection).getClient();
+                jedisPipeline = jedis.pipelined();
+                cpMonitor.incOperationSuccess(connection.getHost(), 0);
+                
+            } catch (NoAvailableHostsException nahe) {
+                cpMonitor.incOperationFailure(connection != null ? connection.getHost() : null, nahe);
+                discardPipelineAndReleaseConnection();
+                throw nahe;
+            }
+        }
+	    
     }
 
     private abstract class PipelineCompressionOperation<R> extends PipelineOperation<R> {
