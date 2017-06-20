@@ -2085,21 +2085,27 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	}
     
     public void sync() {
-        long startTime = System.nanoTime() / 1000;
-        try {
-            jedisPipeline.sync();
-            opMonitor.recordPipelineSync();
-        } catch (JedisConnectionException jce) {
-            String msg = "Failed sync() to host: " + getHostInfo();
-            pipelineEx.set(new FatalConnectionException(msg, jce));
-            cpMonitor.incOperationFailure(connection == null ? null : connection.getHost(), jce);
-            throw jce;
-        } finally {
-            long duration = System.nanoTime() / 1000 - startTime;
-            opMonitor.recordLatency(duration, TimeUnit.MICROSECONDS);
-            discardPipeline(false);
-            releaseConnection();
-        }
+        new PipelineOperation<String>() {
+            @Override
+            Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                long startTime = System.nanoTime() / 1000;
+                try {
+                    jedisPipeline.sync();
+                    opMonitor.recordPipelineSync();
+                } catch (JedisConnectionException jce) {
+                    String msg = "Failed sync() to host: " + getHostInfo();
+                    pipelineEx.set(new FatalConnectionException(msg, jce));
+                    cpMonitor.incOperationFailure(connection == null ? null : connection.getHost(), jce);
+                    throw jce;
+                } finally {
+                    long duration = System.nanoTime() / 1000 - startTime;
+                    opMonitor.recordLatency(duration, TimeUnit.MICROSECONDS);
+                    discardPipeline(false);
+                    releaseConnection();
+                }
+				return null;
+            }
+        }.execute(theKey.get(), OpName.SYNC);
     }
 
     public List<Object> syncAndReturnAll() {
