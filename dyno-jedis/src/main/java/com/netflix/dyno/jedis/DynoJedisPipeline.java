@@ -2293,6 +2293,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	    			reExecutePipelineOperations();
 	    			
 	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
+	    			connection = currentConnection;
 	                jedisPipeline = jedis.pipelined();
 	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
 	    		}
