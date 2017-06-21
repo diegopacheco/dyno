@@ -553,8 +553,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	  			public Object execute(Object client, ConnectionContext state) throws DynoException {
 	  	    		// Re-build all previous Pipeline operations
 	  	    		if (retry.get() >=1 ){
-	  	    			//reExecutePipelineOperations();
-	  	    			
 	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
 	  	    			connection = currentConnection;
 	  	                jedisPipeline = jedis.pipelined();
