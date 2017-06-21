@@ -16,6 +16,7 @@
 package com.netflix.dyno.jedis;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.LinkedList;
@@ -76,6 +77,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     private final ConnectionPoolConfiguration cpConfiguration;
     
     private LinkedList<OperationMetadata> operationQueue = new LinkedList<>();
+    private ReflectionCache reflectionCache = new ReflectionCache();
     
     // the cached pipeline
     private volatile Pipeline jedisPipeline = null;
@@ -384,7 +386,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> append(final String key, final String value) {
-
+    	operationQueue.add(new OperationMetadata(OpName.APPEND ,new Object[]{key,value}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -397,6 +400,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> blpop(final String arg) {
+    	operationQueue.add(new OperationMetadata(OpName.BLPOP ,new Object[]{arg}));
 
         return new PipelineOperation<List<String>>() {
 
@@ -410,6 +414,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> brpop(final String arg) {
+    	operationQueue.add(new OperationMetadata(OpName.BRPOP ,new Object[]{arg}));
+    	
         return new PipelineOperation<List<String>>() {
 
             @Override
@@ -422,6 +428,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> decr(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.DECR ,new Object[]{key}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -434,6 +442,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> decrBy(final String key, final long integer) {
+    	operationQueue.add(new OperationMetadata(OpName.DECRBY ,new Object[]{key,integer}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -446,6 +456,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> del(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.DEL ,new Object[]{key}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -458,6 +470,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> echo(final String string) {
+    	operationQueue.add(new OperationMetadata(OpName.ECHO ,new Object[]{string}));
+    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -470,6 +484,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Boolean> exists(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.EXISTS ,new Object[]{key}));
+    	
         return new PipelineOperation<Boolean>() {
 
             @Override
@@ -482,6 +498,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> expire(final String key, final int seconds) {
+    	operationQueue.add(new OperationMetadata(OpName.EXPIRE ,new Object[]{key,seconds}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -505,6 +523,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> expireAt(final String key, final long unixTime) {
+    	operationQueue.add(new OperationMetadata(OpName.EXPIREAT ,new Object[]{key,unixTime}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -561,6 +581,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Boolean> getbit(final String key, final long offset) {
+    	operationQueue.add(new OperationMetadata(OpName.GETBIT ,new Object[]{key,offset}));
+    	
         return new PipelineOperation<Boolean>() {
 
             @Override
@@ -573,6 +595,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> getrange(final String key, final long startOffset, final long endOffset) {
+    	operationQueue.add(new OperationMetadata(OpName.GETRANGE ,new Object[]{key,startOffset,endOffset}));
+    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -585,6 +609,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> getSet(final String key, final String value) {
+    	operationQueue.add(new OperationMetadata(OpName.GETSET ,new Object[]{key,value}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -609,6 +635,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hdel(final String key, final String... field) {
+    	operationQueue.add(new OperationMetadata(OpName.HDEL ,new Object[]{key,field}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -621,6 +649,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Boolean> hexists(final String key, final String field) {
+    	operationQueue.add(new OperationMetadata(OpName.HEXISTS ,new Object[]{key,field}));
+    	
         return new PipelineOperation<Boolean>() {
 
             @Override
@@ -633,6 +663,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> hget(final String key, final String field) {
+    	operationQueue.add(new OperationMetadata(OpName.HGET ,new Object[]{key,field}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -661,6 +693,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<byte[]> hget(final byte[] key, final byte[] field) {
+    	operationQueue.add(new OperationMetadata(OpName.HGET ,new Object[]{key,field}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<byte[]>() {
                 @Override
@@ -685,6 +719,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Map<String, String>> hgetAll(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.HGETALL ,new Object[]{key}));
 
         return new PipelineOperation<Map<String, String>>() {
 
@@ -708,6 +743,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<Map<byte[], byte[]>> hgetAll(final byte[] key) {
+    	operationQueue.add(new OperationMetadata(OpName.HGETALL ,new Object[]{key}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Map<byte[], byte[]>>() {
                 @Override
@@ -738,6 +775,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hincrBy(final String key, final String field, final long value) {
+    	operationQueue.add(new OperationMetadata(OpName.HINCRBY ,new Object[]{key,field,value}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -749,6 +788,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<Double> hincrByFloat(final String key, final String field, final double value) {
+    	operationQueue.add(new OperationMetadata(OpName.HINCRBYFLOAT ,new Object[]{key,field,value}));
+    	
         return new PipelineOperation<Double>() {
 
             @Override
@@ -760,6 +801,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> hkeys(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.HKEYS ,new Object[]{key}));
+    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -779,6 +822,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hlen(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.HLEN ,new Object[]{key}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -794,6 +839,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<List<byte[]>> hmget(final byte[] key, final byte[]... fields) {
+    	operationQueue.add(new OperationMetadata(OpName.HMGET ,new Object[]{key,fields}));
+    	
         return new PipelineOperation<List<byte[]>>() {
 
             @Override
@@ -811,6 +858,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> hmget(final String key, final String... fields) {
+    	operationQueue.add(new OperationMetadata(OpName.HMGET ,new Object[]{key,fields}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<List<String>>() {
                 @Override
@@ -850,6 +899,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented since only a few binary commands are present.
      */
     public Response<String> hmset(final byte[] key, final Map<byte[], byte[]> hash) {
+    	operationQueue.add(new OperationMetadata(OpName.HMSET ,new Object[]{key,hash}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -888,6 +939,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> hmset(final String key, final Map<String, String> hash) {
+    	operationQueue.add(new OperationMetadata(OpName.HMSET ,new Object[]{key,hash}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -926,6 +979,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hset(final String key, final String field, final String value) {
+    	operationQueue.add(new OperationMetadata(OpName.HSET ,new Object[]{key,field,value}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -953,6 +1008,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<Long> hset(final byte[] key, final byte[] field, final byte[] value) {
+    	operationQueue.add(new OperationMetadata(OpName.HSET ,new Object[]{key,field,value}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -977,6 +1034,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hsetnx(final String key, final String field, final String value) {
+    	operationQueue.add(new OperationMetadata(OpName.HSETNX ,new Object[]{key,field,value}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -1001,6 +1060,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> hvals(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.HVALS ,new Object[]{key}));
+    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<List<String>>() {
                 @Override
@@ -1026,6 +1087,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> incr(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.INCR ,new Object[]{key}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1039,6 +1102,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> incrBy(final String key, final long integer) {
+    	operationQueue.add(new OperationMetadata(OpName.INCRBYFLOAT ,new Object[]{key,integer}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1052,6 +1117,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<Double> incrByFloat(final String key, final double increment) {
+    	operationQueue.add(new OperationMetadata(OpName.INCRBYFLOAT ,new Object[]{key,increment}));
+    	
         return new PipelineOperation<Double>() {
 
             @Override
@@ -1066,6 +1133,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> lindex(final String key, final long index) {
+    	operationQueue.add(new OperationMetadata(OpName.LINDEX ,new Object[]{key,index}));
+    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1079,6 +1148,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> linsert(final String key, final LIST_POSITION where, final String pivot, final String value) {
+    	operationQueue.add(new OperationMetadata(OpName.LINSERT ,new Object[]{key,where,pivot,value}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1092,6 +1163,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> llen(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.LLEN ,new Object[]{key}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1105,6 +1178,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> lpop(final String key) {
+    	operationQueue.add(new OperationMetadata(OpName.LPOP ,new Object[]{key}));
+    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1118,6 +1193,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> lpush(final String key, final String... string) {
+    	operationQueue.add(new OperationMetadata(OpName.LPUSH ,new Object[]{key,string}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1131,6 +1208,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> lpushx(final String key, final String... string) {
+    	operationQueue.add(new OperationMetadata(OpName.LPUSHX ,new Object[]{key,string}));
+    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2205,15 +2284,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     		   
     		  // Re-build all previous Pipeline operations
     		  if (retry.getAttemptCount()>=1){
-    			  
-    			  LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
-    			  oq.addAll(operationQueue);
-    			  
-    			  for(OperationMetadata o : oq){
-    				  Method m = this.getClass().getDeclaredMethod(o.getName().name().toLowerCase(), o.toClassArraySignature());
-    				  m.invoke(this, o.getArgs());
-    			  }
-    			  operationQueue = new LinkedList<>();
+    			  reExecutePipelineOperations();
     		  }
     		  
                jedisPipeline.sync();
@@ -2246,6 +2317,24 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         
     	throw lastException;
     }
+
+	private void reExecutePipelineOperations() throws NoSuchMethodException, IllegalAccessException, InvocationTargetException {
+		LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
+		oq.addAll(operationQueue);
+		  
+	    for(OperationMetadata o : oq){
+		  String methodName = o.getName().name().toLowerCase();
+		  Class[] methodArgs = o.toClassArraySignature();
+		  
+		  Method m = reflectionCache.get(methodName);
+		  if (m==null){
+			  m = this.getClass().getDeclaredMethod(methodName,methodArgs);
+			  reflectionCache.add(methodName, m);
+		  }
+	 	  m.invoke(this, o.getArgs());
+	   }
+	   operationQueue = new LinkedList<>();
+	}
 
     public List<Object> syncAndReturnAll() {
         long startTime = System.nanoTime() / 1000;
