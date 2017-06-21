@@ -16,7 +16,6 @@
 package com.netflix.dyno.jedis;
 
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.LinkedList;
@@ -37,13 +36,11 @@ import com.netflix.dyno.connectionpool.ConnectionContext;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionStrategy;
 import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
-import com.netflix.dyno.connectionpool.Operation;
-import com.netflix.dyno.connectionpool.RetryPolicy;
 import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
 import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
 import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
-import com.netflix.dyno.connectionpool.impl.PipelineOperation;
+import com.netflix.dyno.connectionpool.impl.OperationResultImpl;
 import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
 import com.netflix.dyno.connectionpool.impl.utils.ZipUtils;
 import com.netflix.dyno.jedis.JedisConnectionFactory.JedisConnection;
@@ -62,7 +59,6 @@ import redis.clients.jedis.SortingParams;
 import redis.clients.jedis.Tuple;
 import redis.clients.jedis.commands.RedisPipeline;
 import redis.clients.jedis.exceptions.JedisConnectionException;
-import redis.clients.jedis.exceptions.JedisException;
 import redis.clients.jedis.params.geo.GeoRadiusParam;
 import redis.clients.jedis.params.sortedset.ZAddParams;
 import redis.clients.jedis.params.sortedset.ZIncrByParams;
@@ -543,43 +539,66 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         throw new UnsupportedOperationException("not yet implemented");
     }
 
-    @Override
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+	@Override
     public Response<String> get(final String key) {
     	operationQueue.add(new OperationMetadata(OpName.GET ,new Object[]{key}));
     	
-        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-            return new PipelineOperation<String>() {
-                @Override
-                Response<String> execute(Pipeline jedisPipeline) throws DynoException {
-                    long startTime = System.nanoTime() / 1000;
-                    try {
-                        return jedisPipeline.get(key);
-                    }catch(JedisException je){
-                    	throw je;
-                    }
-                    catch(Exception e){
-                    	throw new RuntimeException(e);
-                    }
-                    finally {
-                        long duration = System.nanoTime() / 1000 - startTime;
+        final AtomicReference<Integer> retry = new AtomicReference<Integer>(0);
+        
+        OperationResultImpl<Response> result = (OperationResultImpl<Response>) connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
+	  		  	private Connection currentConnection = null;
+	  		  
+	  			@Override
+	  			public Object execute(Object client, ConnectionContext state) throws DynoException {
+	  	    		// Re-build all previous Pipeline operations
+	  	    		if (retry.get() >=1 ){
+	  	    			//reExecutePipelineOperations();
+	  	    			
+	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
+	  	    			connection = currentConnection;
+	  	                jedisPipeline = jedis.pipelined();
+	  	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
+	  	    		}
+	  	    		retry.getAndSet( retry.get() + 1);
+	  	    		
+	  	    		if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+	  	    			long startTime = System.nanoTime() / 1000;
+	  	    			
+	  	    			Response<String> result = jedisPipeline.get(key);
+	  	    			
+	  	    			long duration = System.nanoTime() / 1000 - startTime;
                         opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
-                    }
-                }
-            }.execute(key, OpName.GET);
-        } else {
-            return new PipelineCompressionOperation<String>() {
-                @Override
-                Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
-                    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
-                        @Override
-                        public Response<String> call() {
-                            return jedisPipeline.get(key);
-                        }
-                    });
-                }
-            }.execute(key, OpName.GET);
-        }
-
+                        
+                        return result;
+	  	    		}else{
+	  	    		    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
+	                        @Override
+	                        public Response<String> call() {
+	                            return jedisPipeline.get(key);
+	                        }
+	                    });
+	  	    		}
+	  				
+	  			}
+	  			@Override
+	  			public String getName() {
+	  				return DynoPipeline;
+	  			}
+	  			@Override
+	  			public String getKey() {
+	  				return theKey.get();
+	  			}
+	  			@Override
+	  			public Connection getConnection() {
+	  				return currentConnection;
+	  			}
+	  			@Override
+	  			public void setConnection(Connection connection) {
+	  				this.currentConnection = connection;
+	  			}
+	  	  });
+        return result.getResult();
     }
 
     @Override
