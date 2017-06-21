@@ -323,19 +323,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
        	  	    			
        	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
        	  	    			connection = currentConnection;
-       	  	    		
-       	  	    			if(jedisPipeline!=null){
-	       	  	    			try {
-	       	  	    				  Object multi = FieldUtils.readField(Pipeline.class, "currentMulti", true);
-	         	  	                  jedisPipeline = jedis.pipelined();
-	         	  	                  FieldUtils.writeField(Pipeline.class, "currentMulti", multi);
-	  							} catch (Exception e) {
-	  								throw new RuntimeException(e);
-	  							}
-       	  	    			}else{
-       	  	    				jedisPipeline = jedis.pipelined();
-       	  	    			}
-       	  	    			
+       	  	    			jedisPipeline = jedis.pipelined();
        	  	                
        	  	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
        	  	    		}
@@ -2158,7 +2146,14 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public void close() throws Exception {
-        discardPipelineAndReleaseConnection();
+    	 new PipelineOperation<String>() {
+             @Override
+             Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+            	 discardPipelineAndReleaseConnection();
+            	 return null;
+             }
+         }.execute(theKey.get(),OpName.CLOSE);
+        
     }
 
     private String getHostInfo() {
