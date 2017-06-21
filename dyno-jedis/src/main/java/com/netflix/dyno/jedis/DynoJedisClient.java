@@ -3328,7 +3328,7 @@ public class DynoJedisClient implements JedisCommands, BinaryJedisCommands, Mult
     }
 
     public DynoJedisPipeline pipelined() {
-        return new DynoJedisPipeline(getConnPool(), checkAndInitPipelineMonitor(), getConnPool().getMonitor(),getConnPool().getConfiguration());
+        return new DynoJedisPipeline(getConnPool(), checkAndInitPipelineMonitor(), getConnPool().getMonitor());
     }
 
     private DynoJedisPipelineMonitor checkAndInitPipelineMonitor() {

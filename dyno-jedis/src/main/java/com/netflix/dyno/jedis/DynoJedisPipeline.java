@@ -16,9 +16,7 @@
 package com.netflix.dyno.jedis;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -27,10 +25,10 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
+import org.apache.commons.lang.reflect.FieldUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.netflix.dyno.connectionpool.BaseOperation;
 import com.netflix.dyno.connectionpool.Connection;
 import com.netflix.dyno.connectionpool.ConnectionContext;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
@@ -38,7 +36,6 @@ import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionSt
 import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
 import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
-import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
 import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
 import com.netflix.dyno.connectionpool.impl.OperationResultImpl;
 import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
@@ -64,7 +61,7 @@ import redis.clients.jedis.params.sortedset.ZAddParams;
 import redis.clients.jedis.params.sortedset.ZIncrByParams;
 
 @NotThreadSafe
-@SuppressWarnings({ "rawtypes", "unchecked" })
+@SuppressWarnings({"unchecked","rawtypes"})
 public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     private static final Logger Logger = LoggerFactory.getLogger(DynoJedisPipeline.class);
@@ -74,11 +71,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     private volatile Connection<Jedis> connection;
     private final DynoJedisPipelineMonitor opMonitor;
     private final ConnectionPoolMonitor cpMonitor;
-    private final ConnectionPoolConfiguration cpConfiguration;
-    
-    private LinkedList<OperationMetadata> operationQueue = new LinkedList<>();
-    private ReflectionCache reflectionCache = new ReflectionCache();
-    
+
     // the cached pipeline
     private volatile Pipeline jedisPipeline = null;
     // the cached row key for the pipeline. all subsequent requests to pipeline must be the same. this is used to check that.
@@ -86,51 +79,22 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     // used for tracking errors
     private final AtomicReference<DynoException> pipelineEx = new AtomicReference<DynoException>(null);
 
-    private static final String DynoPipeline = "DynoPipeline";
-
-    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor,ConnectionPoolConfiguration cpConfig) {
+    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor) {
         this.connPool = cPool;
         this.opMonitor = operationMonitor;
         this.cpMonitor = connPoolMonitor;
-        this.cpConfiguration = cpConfig;
     }
 
     private void checkKey(final String key) {
-
         if (theKey.get() != null) {
             verifyKey(key);
 
         } else {
-
             boolean success = theKey.compareAndSet(null, key);
             if (!success) {
                 // someone already beat us to it. that's fine, just verify that the key is the same
                 verifyKey(key);
-            } else {
-
-                try {
-                    connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
-
-                        @Override
-                        public String getName() {
-                            return DynoPipeline;
-                        }
-
-                        @Override
-                        public String getKey() {
-                            return key;
-                        }
-                    });
-                } catch (NoAvailableHostsException nahe) {
-                    cpMonitor.incOperationFailure(connection != null ? connection.getHost() : null, nahe);
-                    discardPipelineAndReleaseConnection();
-                    throw nahe;
-                }
             }
-
-            Jedis jedis = ((JedisConnection) connection).getClient();
-            jedisPipeline = jedis.pipelined();
-            cpMonitor.incOperationSuccess(connection.getHost(), 0);
         }
     }
 
@@ -322,23 +286,90 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
         }
 
-        Response<R> executeOperation(final OpName opName) {
+		Response<R> executeOperation(final OpName opName) {
             try {
-                opMonitor.recordOperation(opName.name());
-                return execute(jedisPipeline);
-
+            	
+            	return executeWithFallback(new AtomicReference<Integer>(0),opName.name(),new PipelineCommandWithFallback(){
+					@Override
+            		public Response execute() {
+            			opMonitor.recordOperation(opName.name());
+                        return PipelineOperation.this.execute(jedisPipeline);
+					}
+            	});
+            	
             } catch (JedisConnectionException ex) {
                 handleConnectionException(ex);
                 throw ex;
             }
         }
 
-	    void handleConnectionException(JedisConnectionException ex) {
-	        DynoException e = new FatalConnectionException(ex).setAttempt(1);
-	        pipelineEx.set(e);
-	        cpMonitor.incOperationFailure(connection.getHost(), e);
-	    }
-	    
+		Response<R> executeWithFallback(final AtomicReference<Integer> retry,final String opName,final PipelineCommandWithFallback callback){
+
+        	OperationResultImpl<Response> result = (OperationResultImpl<Response>) connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
+       	  		  	private Connection currentConnection = null;
+       	  		  
+       	  			@Override
+       	  			public Object execute(Object client, ConnectionContext state) throws DynoException {
+
+       	  				// Make sure it uses right connection. 
+       	  				if (connection==null){
+       	  					Jedis jedis = ((JedisConnection) currentConnection).getClient();
+       	  					connection = currentConnection;
+       	  					jedisPipeline = jedis.pipelined();
+       	  				}
+       	  				
+       	  				// Re-build connection for fallback.
+       	  	    		if (retry.get() >=1 ){
+       	  	    			
+       	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
+       	  	    			connection = currentConnection;
+       	  	    		
+       	  	    			if(jedisPipeline!=null){
+	       	  	    			try {
+	       	  	    				  Object multi = FieldUtils.readField(Pipeline.class, "currentMulti", true);
+	         	  	                  jedisPipeline = jedis.pipelined();
+	         	  	                  FieldUtils.writeField(Pipeline.class, "currentMulti", multi);
+	  							} catch (Exception e) {
+	  								throw new RuntimeException(e);
+	  							}
+       	  	    			}else{
+       	  	    				jedisPipeline = jedis.pipelined();
+       	  	    			}
+       	  	    			
+       	  	                
+       	  	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
+       	  	    		}
+       	  	    		retry.getAndSet( retry.get() + 1);
+       	  	    		
+       	  	    		Response result = callback.execute();
+       	  	    		return result;
+       	  				
+       	  			}
+       	  			@Override
+       	  			public String getName() {
+       	  				return opName;
+       	  			}
+       	  			@Override
+       	  			public String getKey() {
+       	  				return theKey.get();
+       	  			}
+       	  			@Override
+       	  			public Connection getConnection() {
+       	  				return currentConnection;
+       	  			}
+       	  			@Override
+       	  			public void setConnection(Connection connection) {
+       	  				this.currentConnection = connection;
+       	  			}
+       	  	});
+            return result.getResult();
+        }
+
+        void handleConnectionException(JedisConnectionException ex) {
+            DynoException e = new FatalConnectionException(ex).setAttempt(1);
+            pipelineEx.set(e);
+            cpMonitor.incOperationFailure(connection.getHost(), e);
+        }
     }
 
     private abstract class PipelineCompressionOperation<R> extends PipelineOperation<R> {
@@ -386,127 +417,118 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> append(final String key, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.APPEND ,new Object[]{key,value}));
 
-    	Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.APPEND.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.append(key, value);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.append(key, value);
+            }
+
+        }.execute(key, OpName.APPEND);
     }
 
     @Override
     public Response<List<String>> blpop(final String arg) {
-    	operationQueue.add(new OperationMetadata(OpName.BLPOP ,new Object[]{arg}));
 
-    	Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.BLPOP.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.blpop(arg);
-        	}
-		});
-        return result;
+        return new PipelineOperation<List<String>>() {
+
+            @Override
+            Response<List<String>> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.blpop(arg);
+            }
+        }.execute(arg, OpName.BLPOP);
+
     }
 
     @Override
     public Response<List<String>> brpop(final String arg) {
-    	operationQueue.add(new OperationMetadata(OpName.BRPOP ,new Object[]{arg}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.BRPOP.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.brpop(arg);
-        	}
-		});
-        return result;
+        return new PipelineOperation<List<String>>() {
+
+            @Override
+            Response<List<String>> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.brpop(arg);
+            }
+        }.execute(arg, OpName.BRPOP);
+
     }
 
     @Override
     public Response<Long> decr(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.DECR ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.DECR.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.decr(key);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.decr(key);
+            }
+        }.execute(key, OpName.DECR);
+
     }
 
     @Override
     public Response<Long> decrBy(final String key, final long integer) {
-    	operationQueue.add(new OperationMetadata(OpName.DECRBY ,new Object[]{key,integer}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.DECRBY.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.decrBy(key, integer);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.decrBy(key, integer);
+            }
+        }.execute(key, OpName.DECRBY);
+
     }
 
     @Override
     public Response<Long> del(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.DEL ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.DEL.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.del(key);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.del(key);
+            }
+        }.execute(key, OpName.DEL);
 
     }
 
     @Override
     public Response<String> echo(final String string) {
-    	operationQueue.add(new OperationMetadata(OpName.ECHO ,new Object[]{string}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.ECHO.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.echo(string);
-        	}
-		});
-        return result;
+        return new PipelineOperation<String>() {
+
+            @Override
+            Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.echo(string);
+            }
+        }.execute(string, OpName.ECHO);
 
     }
 
     @Override
     public Response<Boolean> exists(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.EXISTS ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.EXISTS.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.exists(key);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Boolean>() {
+
+            @Override
+            Response<Boolean> execute(final Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.exists(key);
+            }
+        }.execute(key, OpName.EXISTS);
+
     }
 
     @Override
     public Response<Long> expire(final String key, final int seconds) {
-    	operationQueue.add(new OperationMetadata(OpName.EXPIRE ,new Object[]{key,seconds}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.EXPIRE.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		long startTime = System.nanoTime() / 1000;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(final Pipeline jedisPipeline) throws DynoException {
+                long startTime = System.nanoTime() / 1000;
                 try {
                     return jedisPipeline.expire(key, seconds);
                 } finally {
                     long duration = System.nanoTime() / 1000 - startTime;
                     opMonitor.recordSendLatency(OpName.EXPIRE.name(), duration, TimeUnit.MICROSECONDS);
                 }
-        	}
-		});
-        return result;
+            }
+        }.execute(key, OpName.EXPIRE);
+
     }
 
     @Override
@@ -516,15 +538,14 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> expireAt(final String key, final long unixTime) {
-    	operationQueue.add(new OperationMetadata(OpName.EXPIREAT ,new Object[]{key,unixTime}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.EXPIREAT.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.expireAt(key, unixTime);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(final Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.expireAt(key, unixTime);
+            }
+        }.execute(key, OpName.EXPIREAT);
+
     }
 
     @Override
@@ -532,145 +553,132 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         throw new UnsupportedOperationException("not yet implemented");
     }
 
-	@Override
+    @Override
     public Response<String> get(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.GET ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.GET.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-  	    			long startTime = System.nanoTime() / 1000;
-  	    			
-  	    			Response<String> result = jedisPipeline.get(key);
-  	    			
-  	    			long duration = System.nanoTime() / 1000 - startTime;
-                    opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
-                    
-                    return result;
-  	    		}else{
-  	    		    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<String>() {
+                @Override
+                Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                    long startTime = System.nanoTime() / 1000;
+                    try {
+                        return jedisPipeline.get(key);
+                    } finally {
+                        long duration = System.nanoTime() / 1000 - startTime;
+                        opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
+                    }
+                }
+            }.execute(key, OpName.GET);
+        } else {
+            return new PipelineCompressionOperation<String>() {
+                @Override
+                Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
                         @Override
                         public Response<String> call() {
                             return jedisPipeline.get(key);
                         }
                     });
-  	    		}
-        	}
-		});
-        return result;
+                }
+            }.execute(key, OpName.GET);
+        }
+
     }
 
     @Override
     public Response<Boolean> getbit(final String key, final long offset) {
-    	operationQueue.add(new OperationMetadata(OpName.GETBIT ,new Object[]{key,offset}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.GETBIT.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.getbit(key, offset);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Boolean>() {
+
+            @Override
+            Response<Boolean> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.getbit(key, offset);
+            }
+        }.execute(key, OpName.GETBIT);
 
     }
 
     @Override
     public Response<String> getrange(final String key, final long startOffset, final long endOffset) {
-    	operationQueue.add(new OperationMetadata(OpName.GETRANGE ,new Object[]{key,startOffset,endOffset}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.GETRANGE.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		return jedisPipeline.getrange(key, startOffset, endOffset);
-        	}
-		});
-        return result;
+        return new PipelineOperation<String>() {
+
+            @Override
+            Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.getrange(key, startOffset, endOffset);
+            }
+        }.execute(key, OpName.GETRANGE);
+
     }
 
     @Override
     public Response<String> getSet(final String key, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.GETSET ,new Object[]{key,value}));
-        
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.GETSET.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-                        return jedisPipeline.getSet(key, value);
-                } else {
-                    return new PipelineCompressionOperation<String>() {
-                        @Override
-                        Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
-                            return new PipelineResponse(null).apply(new Func0<Response<String>>() {
-                                @Override
-                                public Response<String> call() {
-                                    return jedisPipeline.getSet(key, compressValue(value));
-                                }
-                            });
-                        }
-                    }.execute(key, OpName.GETSET);
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<String>() {
+                @Override
+                Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                    return jedisPipeline.getSet(key, value);
                 }
-        	}
-		});
-        return result;
+            }.execute(key, OpName.GETSET);
+        } else {
+            return new PipelineCompressionOperation<String>() {
+                @Override
+                Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
+                        @Override
+                        public Response<String> call() {
+                            return jedisPipeline.getSet(key, compressValue(value));
+                        }
+                    });
+                }
+            }.execute(key, OpName.GETSET);
+        }
     }
 
     @Override
     public Response<Long> hdel(final String key, final String... field) {
-    	operationQueue.add(new OperationMetadata(OpName.HDEL ,new Object[]{key,field}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HDEL.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                 return jedisPipeline.hdel(key, field);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.hdel(key, field);
+            }
+        }.execute(key, OpName.HDEL);
+
     }
 
     @Override
     public Response<Boolean> hexists(final String key, final String field) {
-    	operationQueue.add(new OperationMetadata(OpName.HEXISTS ,new Object[]{key,field}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HEXISTS.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                 return jedisPipeline.hexists(key, field);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Boolean>() {
+
+            @Override
+            Response<Boolean> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.hexists(key, field);
+            }
+        }.execute(key, OpName.HEXISTS);
+
     }
 
     @Override
     public Response<String> hget(final String key, final String field) {
-    	operationQueue.add(new OperationMetadata(OpName.HGET ,new Object[]{key,field}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HGET.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-                    return new PipelineOperation<String>() {
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<String>() {
+                @Override
+                Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                    return jedisPipeline.hget(key, field);
+                }
+            }.execute(key, OpName.HGET);
+        } else {
+            return new PipelineCompressionOperation<String>() {
+                @Override
+                Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
                         @Override
-                        Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                        public Response<String> call() {
                             return jedisPipeline.hget(key, field);
                         }
-                    }.execute(key, OpName.HGET);
-                } else {
-                    return new PipelineCompressionOperation<String>() {
-                        @Override
-                        Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
-                            return new PipelineResponse(null).apply(new Func0<Response<String>>() {
-                                @Override
-                                public Response<String> call() {
-                                    return jedisPipeline.hget(key, field);
-                                }
-                            });
-                        }
-                    }.execute(key, OpName.HGET);
+                    });
                 }
-        	}
-		});
-        return result;
+            }.execute(key, OpName.HGET);
+        }
+
     }
 
     /**
@@ -678,43 +686,35 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<byte[]> hget(final byte[] key, final byte[] field) {
-    	operationQueue.add(new OperationMetadata(OpName.HGET ,new Object[]{key,field}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.EXPIRE.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-                    return new PipelineOperation<byte[]>() {
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<byte[]>() {
+                @Override
+                Response<byte[]> execute(Pipeline jedisPipeline) throws DynoException {
+                    return jedisPipeline.hget(key, field);
+                }
+            }.execute(key, OpName.HGET);
+        } else {
+            return new PipelineCompressionOperation<byte[]>() {
+                @Override
+                Response<byte[]> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineBinaryResponse(null).apply(new Func0<Response<byte[]>>() {
                         @Override
-                        Response<byte[]> execute(Pipeline jedisPipeline) throws DynoException {
+                        public Response<byte[]> call() {
                             return jedisPipeline.hget(key, field);
                         }
-                    }.execute(key, OpName.HGET);
-                } else {
-                    return new PipelineCompressionOperation<byte[]>() {
-                        @Override
-                        Response<byte[]> execute(final Pipeline jedisPipeline) throws DynoException {
-                            return new PipelineBinaryResponse(null).apply(new Func0<Response<byte[]>>() {
-                                @Override
-                                public Response<byte[]> call() {
-                                    return jedisPipeline.hget(key, field);
-                                }
-                            });
-                        }
-                    }.execute(key, OpName.HGET);
+                    });
                 }
-        	}
-		});
-        return result;
+            }.execute(key, OpName.HGET);
+        }
     }
 
     @Override
     public Response<Map<String, String>> hgetAll(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.HGETALL ,new Object[]{key}));
 
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HGETALL.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
+        return new PipelineOperation<Map<String, String>>() {
+
+            @Override
+            Response<Map<String, String>> execute(Pipeline jedisPipeline) throws DynoException {
                 long startTime = System.nanoTime() / 1000;
                 try {
                     return jedisPipeline.hgetAll(key);
@@ -722,9 +722,10 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
                     long duration = System.nanoTime() / 1000 - startTime;
                     opMonitor.recordSendLatency(OpName.HGETALL.name(), duration, TimeUnit.MICROSECONDS);
                 }
-        	}
-		});
-        return result;
+            }
+
+        }.execute(key, OpName.HGETALL);
+
     }
 
     /**
@@ -732,89 +733,77 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<Map<byte[], byte[]>> hgetAll(final byte[] key) {
-    	operationQueue.add(new OperationMetadata(OpName.HGETALL ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HGETALL.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-                    return new PipelineOperation<Map<byte[], byte[]>>() {
-                        @Override
-                        Response<Map<byte[], byte[]>> execute(Pipeline jedisPipeline) throws DynoException {
-                            long startTime = System.nanoTime() / 1000;
-                            try {
-                                return jedisPipeline.hgetAll(key);
-                            } finally {
-                                long duration = System.nanoTime() / 1000 - startTime;
-                                opMonitor.recordSendLatency(OpName.HGETALL.name(), duration, TimeUnit.MICROSECONDS);
-                            }
-                        }
-                    }.execute(key, OpName.HGETALL);
-                } else {
-                    return new PipelineCompressionOperation<Map<byte[], byte[]>>() {
-                        @Override
-                        Response<Map<byte[], byte[]>> execute(final Pipeline jedisPipeline) throws DynoException {
-                            return new PipelineBinaryMapResponse(null).apply(new Func0<Response<Map<byte[], byte[]>>>() {
-                                @Override
-                                public Response<Map<byte[], byte[]>> call() {
-                                    return jedisPipeline.hgetAll(key);
-                                }
-                            });
-                        }
-                    }.execute(key, OpName.HGETALL);
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<Map<byte[], byte[]>>() {
+                @Override
+                Response<Map<byte[], byte[]>> execute(Pipeline jedisPipeline) throws DynoException {
+                    long startTime = System.nanoTime() / 1000;
+                    try {
+                        return jedisPipeline.hgetAll(key);
+                    } finally {
+                        long duration = System.nanoTime() / 1000 - startTime;
+                        opMonitor.recordSendLatency(OpName.HGETALL.name(), duration, TimeUnit.MICROSECONDS);
+                    }
                 }
-        	}
-		});
-        return result;
+            }.execute(key, OpName.HGETALL);
+        } else {
+            return new PipelineCompressionOperation<Map<byte[], byte[]>>() {
+                @Override
+                Response<Map<byte[], byte[]>> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineBinaryMapResponse(null).apply(new Func0<Response<Map<byte[], byte[]>>>() {
+                        @Override
+                        public Response<Map<byte[], byte[]>> call() {
+                            return jedisPipeline.hgetAll(key);
+                        }
+                    });
+                }
+            }.execute(key, OpName.HGETALL);
+        }
     }
 
     @Override
     public Response<Long> hincrBy(final String key, final String field, final long value) {
-    	operationQueue.add(new OperationMetadata(OpName.HINCRBY ,new Object[]{key,field,value}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HINCRBY.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                 return jedisPipeline.hincrBy(key, field, value);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Long>() {
+
+            @Override
+            Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.hincrBy(key, field, value);
+            }
+        }.execute(key, OpName.HINCRBY);
     }
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<Double> hincrByFloat(final String key, final String field, final double value) {
-    	operationQueue.add(new OperationMetadata(OpName.HINCRBYFLOAT ,new Object[]{key,field,value}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HINCRBYFLOAT.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                 return jedisPipeline.hincrByFloat(key, field, value);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Double>() {
+
+            @Override
+            Response<Double> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.hincrByFloat(key, field, value);
+            }
+        }.execute(key, OpName.HINCRBYFLOAT);
     }
 
     @Override
     public Response<Set<String>> hkeys(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.HKEYS ,new Object[]{key}));
-    	
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.HKEYS.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-                 return jedisPipeline.hkeys(key);
-        	}
-		});
-        return result;
+        return new PipelineOperation<Set<String>>() {
+
+            @Override
+            Response<Set<String>> execute(Pipeline jedisPipeline) throws DynoException {
+                return jedisPipeline.hkeys(key);
+            }
+        }.execute(key, OpName.HKEYS);
+
     }
+    
+ 
 
     public Response<ScanResult<Map.Entry<String, String>>> hscan(final String key, int cursor) {
         throw new UnsupportedOperationException("'HSCAN' cannot be called in pipeline");
     }
 
+
     @Override
     public Response<Long> hlen(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.HLEN ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -830,8 +819,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<List<byte[]>> hmget(final byte[] key, final byte[]... fields) {
-    	operationQueue.add(new OperationMetadata(OpName.HMGET ,new Object[]{key,fields}));
-    	
         return new PipelineOperation<List<byte[]>>() {
 
             @Override
@@ -849,8 +836,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> hmget(final String key, final String... fields) {
-    	operationQueue.add(new OperationMetadata(OpName.HMGET ,new Object[]{key,fields}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<List<String>>() {
                 @Override
@@ -890,8 +875,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented since only a few binary commands are present.
      */
     public Response<String> hmset(final byte[] key, final Map<byte[], byte[]> hash) {
-    	operationQueue.add(new OperationMetadata(OpName.HMSET ,new Object[]{key,hash}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -930,8 +913,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> hmset(final String key, final Map<String, String> hash) {
-    	operationQueue.add(new OperationMetadata(OpName.HMSET ,new Object[]{key,hash}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -970,8 +951,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hset(final String key, final String field, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.HSET ,new Object[]{key,field,value}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -999,8 +978,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
      * interface is not yet implemented.
      */
     public Response<Long> hset(final byte[] key, final byte[] field, final byte[] value) {
-    	operationQueue.add(new OperationMetadata(OpName.HSET ,new Object[]{key,field,value}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -1025,8 +1002,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> hsetnx(final String key, final String field, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.HSETNX ,new Object[]{key,field,value}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<Long>() {
                 @Override
@@ -1051,8 +1026,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> hvals(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.HVALS ,new Object[]{key}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<List<String>>() {
                 @Override
@@ -1078,8 +1051,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> incr(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.INCR ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1093,8 +1064,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> incrBy(final String key, final long integer) {
-    	operationQueue.add(new OperationMetadata(OpName.INCRBYFLOAT ,new Object[]{key,integer}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1108,8 +1077,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<Double> incrByFloat(final String key, final double increment) {
-    	operationQueue.add(new OperationMetadata(OpName.INCRBYFLOAT ,new Object[]{key,increment}));
-    	
         return new PipelineOperation<Double>() {
 
             @Override
@@ -1124,8 +1091,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> lindex(final String key, final long index) {
-    	operationQueue.add(new OperationMetadata(OpName.LINDEX ,new Object[]{key,index}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1139,8 +1104,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> linsert(final String key, final LIST_POSITION where, final String pivot, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.LINSERT ,new Object[]{key,where,pivot,value}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1154,8 +1117,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> llen(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.LLEN ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1169,8 +1130,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> lpop(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.LPOP ,new Object[]{key}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1184,8 +1143,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> lpush(final String key, final String... string) {
-    	operationQueue.add(new OperationMetadata(OpName.LPUSH ,new Object[]{key,string}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1199,8 +1156,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> lpushx(final String key, final String... string) {
-    	operationQueue.add(new OperationMetadata(OpName.LPUSHX ,new Object[]{key,string}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1214,8 +1169,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> lrange(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.LRANGE ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<List<String>>() {
 
             @Override
@@ -1229,8 +1182,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> lrem(final String key, final long count, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.LREM ,new Object[]{key,count,value}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1244,8 +1195,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> lset(final String key, final long index, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.LSET ,new Object[]{key,index,value}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1259,8 +1208,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> ltrim(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.LTRIM ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1274,8 +1221,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> move(final String key, final int dbIndex) {
-    	operationQueue.add(new OperationMetadata(OpName.MOVE ,new Object[]{key,dbIndex}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1289,8 +1234,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> persist(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.PERSIST ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1304,8 +1247,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<String> rename(final String oldkey, final String newkey) {
-    	operationQueue.add(new OperationMetadata(OpName.RENAME ,new Object[]{oldkey,newkey}));
-    	
         return new PipelineOperation<String>() {
         	
             @Override
@@ -1318,8 +1259,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
     /* not supported by RedisPipeline 2.7.3 */
     public Response<Long> renamenx(final String oldkey, final String newkey) {
-    	operationQueue.add(new OperationMetadata(OpName.RENAMENX ,new Object[]{oldkey,newkey}));
-    	
         return new PipelineOperation<Long>() {
         	
             @Override
@@ -1332,8 +1271,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> rpop(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.RPOP ,new Object[]{key}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1347,8 +1284,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> rpush(final String key, final String... string) {
-    	operationQueue.add(new OperationMetadata(OpName.RPUSH ,new Object[]{key,string}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1362,8 +1297,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> rpushx(final String key, final String... string) {
-    	operationQueue.add(new OperationMetadata(OpName.RPUSHX ,new Object[]{key,string}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1377,8 +1310,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> sadd(final String key, final String... member) {
-    	operationQueue.add(new OperationMetadata(OpName.SADD ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1392,8 +1323,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> scard(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.SCARD ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1407,8 +1336,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Boolean> sismember(final String key, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.SISMEMBER ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Boolean>() {
 
             @Override
@@ -1422,8 +1349,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> set(final String key, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.SET ,new Object[]{key,value}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -1462,8 +1387,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Boolean> setbit(final String key, final long offset, final boolean value) {
-    	operationQueue.add(new OperationMetadata(OpName.SETBIT ,new Object[]{key,offset,value}));
-    	
         return new PipelineOperation<Boolean>() {
 
             @Override
@@ -1477,8 +1400,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> setex(final String key, final int seconds, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.SETEX ,new Object[]{key,seconds,value}));
-    	
         if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
             return new PipelineOperation<String>() {
                 @Override
@@ -1504,8 +1425,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> setnx(final String key, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.SETNX ,new Object[]{key,value}));
-    	
         return new PipelineOperation<Long>() {
             @Override
             Response<Long> execute(Pipeline jedisPipeline) throws DynoException {
@@ -1516,8 +1435,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> setrange(final String key, final long offset, final String value) {
-    	operationQueue.add(new OperationMetadata(OpName.SETRANGE ,new Object[]{key,offset,value}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1531,8 +1448,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> smembers(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.SMEMBERS ,new Object[]{key}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1546,8 +1461,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> sort(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.SORT ,new Object[]{key}));
-    	
         return new PipelineOperation<List<String>>() {
 
             @Override
@@ -1561,8 +1474,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<List<String>> sort(final String key, final SortingParams sortingParameters) {
-    	operationQueue.add(new OperationMetadata(OpName.SORT ,new Object[]{key,sortingParameters}));
-    	
         return new PipelineOperation<List<String>>() {
 
             @Override
@@ -1576,8 +1487,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> spop(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.SPOP ,new Object[]{key}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1597,8 +1506,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> srandmember(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.SRANDMEMBER ,new Object[]{key}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1612,8 +1519,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> srem(final String key, final String... member) {
-    	operationQueue.add(new OperationMetadata(OpName.SREM ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1644,8 +1549,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> strlen(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.STRLEN ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1659,8 +1562,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> substr(final String key, final int start, final int end) {
-    	operationQueue.add(new OperationMetadata(OpName.SUBSTR ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1674,8 +1575,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> ttl(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.TTL ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1689,8 +1588,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<String> type(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.TYPE ,new Object[]{key}));
-    	
         return new PipelineOperation<String>() {
 
             @Override
@@ -1704,8 +1601,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zadd(final String key, final double score, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZADD ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1719,8 +1614,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     
 	@Override
 	public Response<Long> zadd(final String key, final Map<String, Double> scoreMembers) {
-		operationQueue.add(new OperationMetadata(OpName.ZADD ,new Object[]{key,scoreMembers}));
-		
 		return new PipelineOperation<Long>() {
 
             @Override
@@ -1734,8 +1627,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zcard(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.ZCARD ,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1749,8 +1640,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zcount(final String key, final double min, final double max) {
-    	operationQueue.add(new OperationMetadata(OpName.ZCOUNT ,new Object[]{key,min,max}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1764,8 +1653,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Double> zincrby(final String key, final double score, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZINCRBY ,new Object[]{key,score,member}));
-    	
         return new PipelineOperation<Double>() {
 
             @Override
@@ -1779,8 +1666,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrange(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGE ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1794,8 +1679,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrangeByScore(final String key, final double min, final double max) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEBYSCORE ,new Object[]{key,min,max}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1809,8 +1692,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrangeByScore(final String key, final String min, final String max) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEBYSCORE ,new Object[]{key,min,max}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1824,8 +1705,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrangeByScore(final String key, final double min, final double max, final int offset, final int count) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEBYSCORE ,new Object[]{key,min,max,offset,count}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1839,8 +1718,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrangeByScoreWithScores(final String key, final double min, final double max) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEBYSCOREWITHSCORES ,new Object[]{key,min,max}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -1854,8 +1731,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrangeByScoreWithScores(final String key, final double min, final double max, final int offset, final int count) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEBYSCOREWITHSCORES ,new Object[]{key,min,max,offset,count}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -1869,8 +1744,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrevrangeByScore(final String key, final double max, final double min) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEBYSCORE ,new Object[]{key,max,min}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1884,8 +1757,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrevrangeByScore(final String key, final String max, final String min) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEBYSCORE ,new Object[]{key,max,min}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1899,8 +1770,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrevrangeByScore(final String key, final double max, final double min, final int offset, final int count) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEBYSCOREWITHSCORES ,new Object[]{key,max,min,offset,count}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -1914,8 +1783,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrevrangeByScoreWithScores(final String key, final double max, final double min) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEBYSCOREWITHSCORES ,new Object[]{key,max,min}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -1929,8 +1796,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrevrangeByScoreWithScores(final String key, final double max, final double min, final int offset, final int count) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEBYSCOREWITHSCORES ,new Object[]{key,max,min,offset,count}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -1944,8 +1809,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrangeWithScores(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANGEWITHSCORES ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -1959,8 +1822,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zrank(final String key, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZRANK ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1974,8 +1835,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zrem(final String key, final String... member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREM ,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -1989,8 +1848,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zremrangeByRank(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREMRANGEBYRANK ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2004,8 +1861,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zremrangeByScore(final String key, final double start, final double end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREMRANGEBYSCORE ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2019,8 +1874,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<String>> zrevrange(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGE ,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Set<String>>() {
 
             @Override
@@ -2034,8 +1887,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Set<Tuple>> zrevrangeWithScores(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANGEWITHSCORES,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Set<Tuple>>() {
 
             @Override
@@ -2049,8 +1900,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> zrevrank(final String key, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZREVRANK,new Object[]{key,member}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2064,8 +1913,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Double> zscore(final String key, final String member) {
-    	operationQueue.add(new OperationMetadata(OpName.ZSCORE,new Object[]{key,member}));
-    	
         return new PipelineOperation<Double>() {
 
             @Override
@@ -2106,8 +1953,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> bitcount(final String key) {
-    	operationQueue.add(new OperationMetadata(OpName.BITCOUNT,new Object[]{key}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2121,8 +1966,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     @Override
     public Response<Long> bitcount(final String key, final long start, final long end) {
-    	operationQueue.add(new OperationMetadata(OpName.BITCOUNT,new Object[]{key,start,end}));
-    	
         return new PipelineOperation<Long>() {
 
             @Override
@@ -2231,147 +2074,30 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 			ZIncrByParams arg3) {
         throw new UnsupportedOperationException("not yet implemented");
 	}
-	
     
-	private void fallbackNextConnectionNode(final String key){
-        try {
-            connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
-                @Override
-                public String getName() {
-                    return DynoPipeline;
+    public void sync() {
+        new PipelineOperation<String>() {
+            @Override
+            Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+            	long startTime = System.nanoTime() / 1000;
+                try {
+                    jedisPipeline.sync();
+                    opMonitor.recordPipelineSync();
+                    return null;
+                } catch (JedisConnectionException jce) {
+                    String msg = "Failed sync() to host: " + getHostInfo();
+                    pipelineEx.set(new FatalConnectionException(msg, jce));
+                    cpMonitor.incOperationFailure(connection == null ? null : connection.getHost(), jce);
+                    throw jce;
+                } finally {
+                    long duration = System.nanoTime() / 1000 - startTime;
+                    opMonitor.recordLatency(duration, TimeUnit.MICROSECONDS);
+                    discardPipeline(false);
+                    releaseConnection();
                 }
-                @Override
-                public String getKey() {
-                    return key;
-                }
-            });
-            
-            //connection = selectionStrategy.getConnectionUsingRetryPolicy(op,cpConfiguration.getMaxTimeoutWhenExhausted(), TimeUnit.MILLISECONDS, retry);
-            
-            Jedis jedis = ((JedisConnection) connection).getClient();
-            jedisPipeline = jedis.pipelined();
-            cpMonitor.incOperationSuccess(connection.getHost(), 0);
-            
-        } catch (NoAvailableHostsException nahe) {
-            cpMonitor.incOperationFailure(connection != null ? connection.getHost() : null, nahe);
-            discardPipelineAndReleaseConnection();
-            throw nahe;
-        }
+            }
+        }.execute(theKey.get(),OpName.SYNC);
     }
-    
-    void handleConnectionException(JedisConnectionException ex) {
-        DynoException e = new FatalConnectionException(ex).setAttempt(1);
-        pipelineEx.set(e);
-        cpMonitor.incOperationFailure(connection.getHost(), e);
-    }
-    
-    @SuppressWarnings({ "unchecked", "rawtypes" })
-	public void sync() {
-    	
-      final AtomicReference<Integer> retry = new AtomicReference<Integer>(0);
-      
-	  connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
-		  	private Connection currentConnection = null;
-		  
-			@Override
-			public Object execute(Object client, ConnectionContext state) throws DynoException {
-				
-	    		// Re-build all previous Pipeline operations
-	    		if (retry.get() >=1 ){
-	    			reExecutePipelineOperations();
-	    			
-	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
-	    			connection = currentConnection;
-	                jedisPipeline = jedis.pipelined();
-	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
-	    		}
-	    		retry.getAndSet( retry.get() + 1);
-	    		
-				jedisPipeline.sync();
-				return "OK";
-				
-			}
-			@Override
-			public String getName() {
-				return DynoPipeline;
-			}
-			@Override
-			public String getKey() {
-				return theKey.get();
-			}
-			@Override
-			public Connection getConnection() {
-				return currentConnection;
-			}
-			@Override
-			public void setConnection(Connection connection) {
-				this.currentConnection = connection;
-			}
-	  });
-    
-    }
-    
-    private Response executeWithFallback(final AtomicReference<Integer> retry,final String opName,final PipelineCommandWithFallback callback){
-
-		OperationResultImpl<Response> result = (OperationResultImpl<Response>) connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
-	  		  	private Connection currentConnection = null;
-	  		  
-	  			@Override
-	  			public Object execute(Object client, ConnectionContext state) throws DynoException {
-	  	    		// Re-build connection for fallback.
-	  	    		if (retry.get() >=1 ){
-	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
-	  	    			connection = currentConnection;
-	  	                jedisPipeline = jedis.pipelined();
-	  	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
-	  	    		}
-	  	    		retry.getAndSet( retry.get() + 1);
-	  	    		
-	  	    		return callback.execute();
-	  				
-	  			}
-	  			@Override
-	  			public String getName() {
-	  				return opName;
-	  			}
-	  			@Override
-	  			public String getKey() {
-	  				return theKey.get();
-	  			}
-	  			@Override
-	  			public Connection getConnection() {
-	  				return currentConnection;
-	  			}
-	  			@Override
-	  			public void setConnection(Connection connection) {
-	  				this.currentConnection = connection;
-	  			}
-	  	});
-		
-        return result.getResult();
-    }
-
-	private void reExecutePipelineOperations(){
-		try{
-			LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
-			oq.addAll(operationQueue);
-			  
-		    for(OperationMetadata o : oq){
-			  String methodName = o.getName().name().toLowerCase();
-			  Class[] methodArgs = o.toClassArraySignature();
-			  
-			  Method m = reflectionCache.get(methodName);
-			  if (m==null){
-				  m = this.getClass().getDeclaredMethod(methodName,methodArgs);
-				  reflectionCache.add(methodName, m);
-			  }
-		 	  m.invoke(this, o.getArgs());
-		   }
-		   operationQueue = new LinkedList<>();
-		}catch(Exception e){
-			throw new RuntimeException(e);
-		}
-	}
 
     public List<Object> syncAndReturnAll() {
         long startTime = System.nanoTime() / 1000;
