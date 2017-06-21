@@ -1896,48 +1896,14 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         cpMonitor.incOperationFailure(connection.getHost(), e);
     }
     
-    @SuppressWarnings({ "unchecked", "rawtypes" })
 	public void sync() {
-    	
-      final AtomicReference<Integer> retry = new AtomicReference<Integer>(0);
-      
-	  connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
-		  	private Connection currentConnection = null;
-		  
-			@Override
-			public Object execute(Object client, ConnectionContext state) throws DynoException {
-				
-	    		// Re-build all previous Pipeline operations
-	    		if (retry.get() >=1 ){
-	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
-	    			connection = currentConnection;
-	                jedisPipeline = jedis.pipelined();
-	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
-	    		}
-	    		retry.getAndSet( retry.get() + 1);
-	    		
-				jedisPipeline.sync();
-				return "OK";
-				
-			}
-			@Override
-			public String getName() {
-				return DynoPipeline;
-			}
-			@Override
-			public String getKey() {
-				return theKey.get();
-			}
-			@Override
-			public Connection getConnection() {
-				return currentConnection;
-			}
-			@Override
-			public void setConnection(Connection connection) {
-				this.currentConnection = connection;
-			}
-	  });
-    
+    	executeWithFallback(new AtomicReference<Integer>(0), OpName.SYNC.name(), new PipelineCommandWithFallback() {
+    		@Override
+    		public Response execute() {
+    			jedisPipeline.sync();
+				return null;
+    		}
+		});
     }
     
     private Response executeWithFallback(final AtomicReference<Integer> retry,final String opName,final PipelineCommandWithFallback callback){
