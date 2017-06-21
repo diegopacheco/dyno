@@ -43,6 +43,7 @@ import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
 import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
 import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
+import com.netflix.dyno.connectionpool.impl.PipelineOperation;
 import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
 import com.netflix.dyno.connectionpool.impl.utils.ZipUtils;
 import com.netflix.dyno.jedis.JedisConnectionFactory.JedisConnection;
@@ -2281,7 +2282,26 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     	
       final AtomicReference<Integer> retry = new AtomicReference<Integer>(0);
       
-	  connPool.executeWithFailover(new Operation(){
+	  connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {
+		  	private Connection currentConnection = null;
+		  
+			@Override
+			public Object execute(Object client, ConnectionContext state) throws DynoException {
+				
+	    		// Re-build all previous Pipeline operations
+	    		if (retry.get() >=1 ){
+	    			reExecutePipelineOperations();
+	    			
+	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
+	                jedisPipeline = jedis.pipelined();
+	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
+	    		}
+	    		retry.getAndSet( retry.get() + 1);
+	    		
+				jedisPipeline.sync();
+				return "OK";
+				
+			}
 			@Override
 			public String getName() {
 				return DynoPipeline;
@@ -2291,18 +2311,15 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 				return theKey.get();
 			}
 			@Override
-			public Object execute(Object client, ConnectionContext state) throws DynoException {
-				
-	    		// Re-build all previous Pipeline operations
-	    		if (retry.get() >=1 ){
-	    			reExecutePipelineOperations();
-	    		}
-	    		retry.getAndSet( retry.get() + 1);
-				jedisPipeline.sync();
-				return "OK";
+			public Connection getConnection() {
+				return currentConnection;
 			}
-      });
-
+			@Override
+			public void setConnection(Connection connection) {
+				this.currentConnection = connection;
+			}
+	  });
+    
     }
 
 	private void reExecutePipelineOperations(){

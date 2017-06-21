@@ -303,6 +303,7 @@ public class ConnectionPoolImpl<CL> implements ConnectionPool<CL>, TopologyView 
 		return cpMap.get(host);
 	}
 
+	@SuppressWarnings({ "unchecked", "rawtypes" })
 	@Override
 	public <R> OperationResult<R> executeWithFailover(Operation<CL, R> op) throws DynoException {
 
@@ -324,7 +325,12 @@ public class ConnectionPoolImpl<CL> implements ConnectionPool<CL>, TopologyView 
 				connection.getContext().setMetadata("host", connection.getHost().getHostAddress());
 				connection.getContext().setMetadata("port", connection.getHost().getPort());
 
-				OperationResult<R> result = connection.execute(op);
+				OperationResult<R> result = null;
+				if (op instanceof PipelineOperation){
+					((PipelineOperation)op).setConnection(connection);
+				}
+				result = connection.execute(op);
+				
 
 				// Add context to the result from the successful execution
 				result.setNode(connection.getHost()).addMetadata(connection.getContext().getAll());
