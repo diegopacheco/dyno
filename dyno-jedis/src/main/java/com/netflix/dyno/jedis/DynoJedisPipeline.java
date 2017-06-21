@@ -28,7 +28,6 @@ import javax.annotation.concurrent.NotThreadSafe;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.netflix.dyno.connectionpool.BaseOperation;
 import com.netflix.dyno.connectionpool.Connection;
 import com.netflix.dyno.connectionpool.ConnectionContext;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
@@ -36,7 +35,6 @@ import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionSt
 import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
 import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
-import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
 import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
 import com.netflix.dyno.connectionpool.impl.OperationResultImpl;
 import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
@@ -72,7 +70,6 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     private volatile Connection<Jedis> connection;
     private final DynoJedisPipelineMonitor opMonitor;
     private final ConnectionPoolMonitor cpMonitor;
-    private final ConnectionPoolConfiguration cpConfiguration;
     
     // the cached pipeline
     private volatile Pipeline jedisPipeline = null;
@@ -83,11 +80,10 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
     private static final String DynoPipeline = "DynoPipeline";
 
-    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor,ConnectionPoolConfiguration cpConfig) {
+    DynoJedisPipeline(ConnectionPoolImpl<Jedis> cPool, DynoJedisPipelineMonitor operationMonitor, ConnectionPoolMonitor connPoolMonitor) {
         this.connPool = cPool;
         this.opMonitor = operationMonitor;
         this.cpMonitor = connPoolMonitor;
-        this.cpConfiguration = cpConfig;
     }
 
     private void checkKey(final String key) {
@@ -101,31 +97,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
             if (!success) {
                 // someone already beat us to it. that's fine, just verify that the key is the same
                 verifyKey(key);
-            } else {
-
-                try {
-                    connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
-
-                        @Override
-                        public String getName() {
-                            return DynoPipeline;
-                        }
-
-                        @Override
-                        public String getKey() {
-                            return key;
-                        }
-                    });
-                } catch (NoAvailableHostsException nahe) {
-                    cpMonitor.incOperationFailure(connection != null ? connection.getHost() : null, nahe);
-                    discardPipelineAndReleaseConnection();
-                    throw nahe;
-                }
             }
-
-            Jedis jedis = ((JedisConnection) connection).getClient();
-            jedisPipeline = jedis.pipelined();
-            cpMonitor.incOperationSuccess(connection.getHost(), 0);
         }
     }
 
@@ -1975,6 +1947,14 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	  		  
 	  			@Override
 	  			public Object execute(Object client, ConnectionContext state) throws DynoException {
+
+   	  			    // Make sure to use the right connections
+	  				if (connection==null){
+   	  					Jedis jedis = ((JedisConnection) currentConnection).getClient();
+   	  					connection = currentConnection;
+   	  					jedisPipeline = jedis.pipelined();
+   	  				}
+	  				
 	  	    		// Re-build connection for fallback.
 	  	    		if (retry.get() >=1 ){
 	  	    			Jedis jedis = ((JedisConnection) currentConnection).getClient();
@@ -1982,6 +1962,7 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 	  	                jedisPipeline = jedis.pipelined();
 	  	                cpMonitor.incOperationSuccess(connection.getHost(), 0);
 	  	    		}
+	  	    		
 	  	    		retry.getAndSet( retry.get() + 1);
 	  	    		return callback.execute();
 	  			}
