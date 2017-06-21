@@ -33,9 +33,11 @@ import org.slf4j.LoggerFactory;
 
 import com.netflix.dyno.connectionpool.BaseOperation;
 import com.netflix.dyno.connectionpool.Connection;
+import com.netflix.dyno.connectionpool.ConnectionContext;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionStrategy;
 import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
+import com.netflix.dyno.connectionpool.Operation;
 import com.netflix.dyno.connectionpool.RetryPolicy;
 import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
@@ -2241,7 +2243,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         throw new UnsupportedOperationException("not yet implemented");
 	}
 	
-    private void fallbackNextConnectionNode(final String key){
+    
+	private void fallbackNextConnectionNode(final String key){
         try {
             connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
                 @Override
@@ -2253,6 +2256,8 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
                     return key;
                 }
             });
+            
+            //connection = selectionStrategy.getConnectionUsingRetryPolicy(op,cpConfiguration.getMaxTimeoutWhenExhausted(), TimeUnit.MILLISECONDS, retry);
             
             Jedis jedis = ((JedisConnection) connection).getClient();
             jedisPipeline = jedis.pipelined();
@@ -2271,69 +2276,55 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
         cpMonitor.incOperationFailure(connection.getHost(), e);
     }
     
-    public void sync() {
-    	RuntimeException lastException = null;
-    	RetryPolicy retry = cpConfiguration.getRetryPolicyFactory().getRetryPolicy();
-        retry.begin();
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+	public void sync() {
+    	
+      final AtomicReference<Integer> retry = new AtomicReference<Integer>(0);
+      
+	  connPool.executeWithFailover(new Operation(){
+			@Override
+			public String getName() {
+				return DynoPipeline;
+			}
+			@Override
+			public String getKey() {
+				return theKey.get();
+			}
+			@Override
+			public Object execute(Object client, ConnectionContext state) throws DynoException {
+				
+	    		// Re-build all previous Pipeline operations
+	    		if (retry.get() >=1 ){
+	    			reExecutePipelineOperations();
+	    		}
+	    		retry.getAndSet( retry.get() + 1);
+				jedisPipeline.sync();
+				return "OK";
+			}
+      });
 
-    	long startTime = System.nanoTime() / 1000;
-    	
-    	do {
-    		
-    	  try {
-    		   
-    		  // Re-build all previous Pipeline operations
-    		  if (retry.getAttemptCount()>=1){
-    			  reExecutePipelineOperations();
-    		  }
-    		  
-               jedisPipeline.sync();
-               opMonitor.recordPipelineSync();
-               retry.success();
-               return;
-               
-    	  } catch (JedisConnectionException ex) {
-    	      fallbackNextConnectionNode(theKey.get());
-    	      retry.failure(ex);
-    	      lastException = ex;
-    	  } catch(Exception e){
-    	      retry.failure(e);
-    	      lastException = new RuntimeException(e);
-    	  }
-    			            
-    	}while (retry.allowRetry());
-    	
-    	if (lastException instanceof JedisConnectionException )
-    		handleConnectionException((JedisConnectionException)lastException);
-    	
-    	String msg = "Failed sync() to host: " + getHostInfo();
-        pipelineEx.set(new FatalConnectionException(msg, lastException));
-        cpMonitor.incOperationFailure(connection == null ? null : connection.getHost(), lastException);
-        
-        long duration = System.nanoTime() / 1000 - startTime;
-        opMonitor.recordLatency(duration, TimeUnit.MICROSECONDS);
-        discardPipeline(false);
-        releaseConnection();
-        
-    	throw lastException;
     }
 
-	private void reExecutePipelineOperations() throws NoSuchMethodException, IllegalAccessException, InvocationTargetException {
-		LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
-		oq.addAll(operationQueue);
-		  
-	    for(OperationMetadata o : oq){
-		  String methodName = o.getName().name().toLowerCase();
-		  Class[] methodArgs = o.toClassArraySignature();
-		  
-		  Method m = reflectionCache.get(methodName);
-		  if (m==null){
-			  m = this.getClass().getDeclaredMethod(methodName,methodArgs);
-			  reflectionCache.add(methodName, m);
-		  }
-	 	  m.invoke(this, o.getArgs());
-	   }
-	   operationQueue = new LinkedList<>();
+	private void reExecutePipelineOperations(){
+		try{
+			LinkedList<OperationMetadata>  oq =  new LinkedList<OperationMetadata>();
+			oq.addAll(operationQueue);
+			  
+		    for(OperationMetadata o : oq){
+			  String methodName = o.getName().name().toLowerCase();
+			  Class[] methodArgs = o.toClassArraySignature();
+			  
+			  Method m = reflectionCache.get(methodName);
+			  if (m==null){
+				  m = this.getClass().getDeclaredMethod(methodName,methodArgs);
+				  reflectionCache.add(methodName, m);
+			  }
+		 	  m.invoke(this, o.getArgs());
+		   }
+		   operationQueue = new LinkedList<>();
+		}catch(Exception e){
+			throw new RuntimeException(e);
+		}
 	}
 
     public List<Object> syncAndReturnAll() {
