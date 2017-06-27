@@ -28,6 +28,7 @@ import javax.annotation.concurrent.NotThreadSafe;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.netflix.dyno.connectionpool.BaseOperation;
 import com.netflix.dyno.connectionpool.Connection;
 import com.netflix.dyno.connectionpool.ConnectionContext;
 import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration;
@@ -35,6 +36,7 @@ import com.netflix.dyno.connectionpool.ConnectionPoolConfiguration.CompressionSt
 import com.netflix.dyno.connectionpool.ConnectionPoolMonitor;
 import com.netflix.dyno.connectionpool.exception.DynoException;
 import com.netflix.dyno.connectionpool.exception.FatalConnectionException;
+import com.netflix.dyno.connectionpool.exception.NoAvailableHostsException;
 import com.netflix.dyno.connectionpool.impl.ConnectionPoolImpl;
 import com.netflix.dyno.connectionpool.impl.OperationResultImpl;
 import com.netflix.dyno.connectionpool.impl.utils.CollectionUtils;
@@ -97,7 +99,32 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
             if (!success) {
                 // someone already beat us to it. that's fine, just verify that the key is the same
                 verifyKey(key);
+            }else{
+            
             }
+            	
+//                try {
+//                    connection = connPool.getConnectionForOperation(new BaseOperation<Jedis, String>() {
+//                        @Override
+//                        public String getName() {
+//                            return DynoPipeline;
+//                        }
+//
+//                        @Override
+//                        public String getKey() {
+//                            return key;
+//                        }
+//                    });
+//                } catch (NoAvailableHostsException nahe) {
+//                    cpMonitor.incOperationFailure(connection != null ? connection.getHost() : null, nahe);
+//                    discardPipelineAndReleaseConnection();
+//                    throw nahe;
+//                }
+//            }
+            
+//            Jedis jedis = ((JedisConnection) connection).getClient();
+//            jedisPipeline = jedis.pipelined();
+//            cpMonitor.incOperationSuccess(connection.getHost(), 0);
         }
     }
 
@@ -481,29 +508,32 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
 
 	@Override
     public Response<String> get(final String key) {
-        Response result = executeWithFallback(new AtomicReference<Integer>(0),OpName.GET.name(),new PipelineCommandWithFallback() {
-        	@Override
-        	public Response execute() {
-        		if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
-  	    			long startTime = System.nanoTime() / 1000;
-  	    			
-  	    			Response<String> result = jedisPipeline.get(key);
-  	    			
-  	    			long duration = System.nanoTime() / 1000 - startTime;
-                    opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
-                    
-                    return result;
-  	    		}else{
-  	    		    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
+        if (CompressionStrategy.NONE == connPool.getConfiguration().getCompressionStrategy()) {
+            return new PipelineOperation<String>() {
+                @Override
+                Response<String> execute(Pipeline jedisPipeline) throws DynoException {
+                    long startTime = System.nanoTime() / 1000;
+                    try {
+                        return jedisPipeline.get(key);
+                    } finally {
+                        long duration = System.nanoTime() / 1000 - startTime;
+                        opMonitor.recordSendLatency(OpName.GET.name(), duration, TimeUnit.MICROSECONDS);
+                    }
+                }
+            }.execute(key, OpName.GET);
+        } else {
+            return new PipelineCompressionOperation<String>() {
+                @Override
+                Response<String> execute(final Pipeline jedisPipeline) throws DynoException {
+                    return new PipelineResponse(null).apply(new Func0<Response<String>>() {
                         @Override
                         public Response<String> call() {
                             return jedisPipeline.get(key);
                         }
                     });
-  	    		}
-        	}
-		});
-        return result;
+                }
+            }.execute(key, OpName.GET);
+        }
     }
 
     @Override
@@ -1897,15 +1927,13 @@ public class DynoJedisPipeline implements RedisPipeline, AutoCloseable {
     }
     
 	public void sync() {
-    	executeWithFallback(new AtomicReference<Integer>(0), OpName.SYNC.name(), new PipelineCommandWithFallback() {
-    		@Override
-    		public Response execute() {
-    			jedisPipeline.sync();
-				return null;
-    		}
-		});
-    }
+		jedisPipeline.sync();
+	}
     
+	public Response executeWithFallback(PipelineCommandWithFallback callback){
+		return this.executeWithFallback(new AtomicReference<Integer>(0), OpName.SYNC.name(), callback);
+	}
+	
     private Response executeWithFallback(final AtomicReference<Integer> retry,final String opName,final PipelineCommandWithFallback callback){
 
 		OperationResultImpl<Response> result = (OperationResultImpl<Response>) connPool.executeWithFailover(new com.netflix.dyno.connectionpool.impl.PipelineOperation() {

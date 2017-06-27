@@ -44,16 +44,57 @@ public class DynoJedisPipelineTest {
 		
 		dynoClient.set("k1", "1");
 		
-		DynoJedisPipeline pipe = dynoClient.pipelined();
+		try{
+			DynoJedisPipeline pipe = dynoClient.pipelined();
 
-		Response<String> result = pipe.get("k1");
-		pipe.sync();
-		pipe.close();
+			Response<String> result = pipe.get("k1");
+			pipe.sync();
+			pipe.close();
+			
+			String finalResult = result.get();
+			Assert.assertNotNull(finalResult);
+			Assert.assertEquals("1",finalResult);
+		}catch(Exception e){
+			System.out.println(e);
+		}
 		
-		String finalResult = result.get();
-		Assert.assertNotNull(finalResult);
-		Assert.assertEquals("1",finalResult);
+		try{
+			DynoJedisPipeline pipe = dynoClient.pipelined();
+
+			Response<String> result = pipe.get("k1");
+			pipe.sync();
+			pipe.close();
+			
+			String finalResult = result.get();
+			Assert.assertNotNull(finalResult);
+			Assert.assertEquals("1",finalResult);
+		}catch(Exception e){
+			System.out.println(e);
+		}
 		
+		
+		final DynoJedisPipeline pipe = dynoClient.pipelined();
+		pipe.executeWithFallback(new PipelineCommandWithFallback() {
+			@Override
+			public Response execute() {
+				Response<String> result = pipe.get("k1");
+				pipe.sync();
+				
+				try {
+					pipe.close();
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+				
+				String finalResult = result.get();
+				Assert.assertNotNull(finalResult);
+				Assert.assertEquals("1",finalResult);
+				
+				return result;
+			}
+		});
+			
+				
 	}
 	
 }
